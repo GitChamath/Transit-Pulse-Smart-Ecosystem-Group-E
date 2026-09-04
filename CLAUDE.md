@@ -1,172 +1,135 @@
+C# CLAUDE.md — Transit-pulse
 
-# spec.md — Transit-pulse 
+System scope and agent roles for an Agentic AI OS that stabilises bus headway on
+Colombo city bus corridors.
 
-Inputs, outputs and constraints for the RideFlow Agentic AI OS.
-
----
-
-## 1. Inputs
-
-### 1.1 Live telemetry (simulated)
-
-Published every 30 seconds per bus to the MQTT topic `rideflow/138/<device_id>`.
-
-```json
-{
-  "device_id": "bus-138-07",
-  "operator": "private",
-  "route": "138",
-  "direction": "inbound",
-  "ts": "2026-08-01T10:15:30Z",
-  "lat": 6.8721,
-  "lon": 79.8886,
-  "speed_kmh": 18.4,
-  "next_halt": "nugegoda",
-  "occupancy": 47,
-  "capacity": 54,
-  "headway_s": 40,
-  "sig": "ed25519:9f2c8ab1..."
-}
-```
-
-### 1.2 Halt telemetry (simulated)
-
-```json
-{
-  "device_id": "halt-nugegoda",
-  "ts": "2026-08-01T10:15:30Z",
-  "waiting_est": 22,
-  "last_departure_ts": "2026-08-01T10:07:10Z",
-  "assist_request": false,
-  "sig": "ed25519:41ba07d9..."
-}
-```
-
-### 1.3 Static reference data
-
-- Route 138 halt list with sequence, coordinates and expected run times.
-- Published timetable and planned headway per time band.
-- Fleet register: bus id, operator, capacity, depot.
-- Driver duty-hour records (aggregate, no personal identifiers).
-
-### 1.4 Virtual sensor set
-
-| Sensor | Metric | Frequency | Purpose |
-|---|---|---|---|
-| GPS tracker | `lat`, `lon`, `speed_kmh` | 30 s | position and headway |
-| Passenger counter | `occupancy` | on door close | load and crowding |
-| Halt crowd sensor | `waiting_est` | 30 s | demand ahead of the bus |
-| Fuel / emission meter | `fuel_lph` | 60 s | SDG 13 reporting only |
+**SDG track:** SDG 11 — Sustainable Cities & Communities
+**Secondary benefit:** SDG 13 — Climate Action (fewer private-vehicle trips)
+**Theme:** Empowering Sustainable Innovation
 
 ---
 
-## 2. Outputs
+## 1. System scope
 
-### 2.1 Proposal (Planner → Validator)
+### What the system is
 
-```json
-{
-  "proposal_id": "p-20260801-1015-0042",
-  "agent": "planner",
-  "target": "bus-138-07",
-  "command": "HOLD",
-  "value_s": 75,
-  "at_halt": "nugegoda",
-  "reason": "headway 40 s against a 300 s target; bus-138-09 is 40 s behind",
-  "expected_effect": "headway restored to ~210 s within 2 halts",
-  "confidence": 0.78
-}
-```
+RideFlow is a **supervisory** agentic system. It reads simulated bus telemetry,
+detects bus bunching and headway drift on a route, and issues short advisories to
+drivers, depot controllers and commuters so that buses stay evenly spaced.
 
-### 2.2 Advisory (Action → driver / commuter / dashboard)
+### What the system is NOT
 
-```json
-{
-  "advisory_id": "a-20260801-1015-0042",
-  "proposal_id": "p-20260801-1015-0042",
-  "target": "bus-138-07",
-  "display": "HOLD 75s",
-  "expires_ts": "2026-08-01T10:17:00Z",
-  "approved_by": "validator",
-  "override_url": "depot://cancel/a-20260801-1015-0042"
-}
-```
+- It is **not** a vehicle control system. It never accelerates, brakes or steers.
+- It is **not** a scheduling authority. It advises inside an existing timetable.
+- It is **not** a passenger identity system. It counts people, it does not identify them.
 
-### 2.3 Audit record (every cycle, append-only)
+### Users
 
-```json
-{
-  "ts": "2026-08-01T10:15:32Z",
-  "proposal_id": "p-20260801-1015-0042",
-  "verdict": "approved",
-  "rules_checked": ["hold_cap", "halt_starvation", "assist_flag", "duty_hours", "fairness"],
-  "validator_note": "within all limits",
-  "outcome_score": null
-}
-```
+| User | What they get |
+|---|---|
+| Bus driver | A short advisory on a tablet or phone: `HOLD 75s`, `SKIP STOP`, `PROCEED` |
+| Depot controller | A live corridor board, plus a one-tap cancel and stop control |
+| Commuter | A corrected, honest ETA at the halt display or in the app |
+| Regulator (NTC / WPRPTA) | A weekly reliability and compliance report per route |
 
-### 2.4 Commuter output
+### Boundary of the pilot
 
-A corrected ETA per halt, plus a crowding indicator (`green` / `amber` / `red`).
-No bus identifier, no driver identifier, no passenger data.
+One corridor: **Route 138, Pettah – Homagama**, 30 simulated buses, 12 halts,
+06:00–21:00, 30-second tick.
 
 ---
 
-## 3. Constraints
+## 2. Agent roles
 
-### 3.1 Safety constraints
+Four agents. Each has one job, one toolset, one permission level. Separation of
+duties is deliberate: **the agent that plans is never the agent that acts.**
 
-| ID | Constraint |
-|---|---|
-| S1 | Maximum hold duration: 120 seconds |
-| S2 | No halt unserved for more than 20 minutes |
-| S3 | Skip-stop forbidden when an assistance request is registered |
-| S4 | No advisory to a driver over duty hours |
-| S5 | No advisory that would require exceeding the speed limit |
+### 2.1 Monitor Agent
 
-### 3.2 Operational constraints
+- **Job:** Read the telemetry stream. Compute per-bus headway, occupancy ratio and
+  ETA to the next three halts. Raise a `drift` flag when spacing breaks.
+- **Tools:** `telemetry.read()`, `headway.compute()`, `eta.compute()`
+- **Permission:** read-only on the telemetry topic. Cannot write anywhere except
+  its own flag queue.
+- **Trigger condition:** `headway_s < 90` (bunching) or `headway_s > 900` (gap) or
+  `occupancy / capacity > 0.90`.
 
-| ID | Constraint |
-|---|---|
-| O1 | Holds distributed fairly across operators over a rolling 60 minutes |
-| O2 | Maximum 1 short-turn per bus per shift |
-| O3 | Advisories expire after 120 seconds if not acknowledged |
-| O4 | On sensor loss, the OS degrades to schedule-only mode and issues no holds |
+### 2.2 Planner Agent
 
-### 3.3 Security constraints
+- **Job:** Reason about a flagged corridor segment and propose exactly **one**
+  intervention with a stated expected effect.
+- **Tools:** `corridor.state()`, `simulate(action)` — a sandbox that projects the
+  next 15 minutes. No network write access.
+- **Permission:** simulate only. Cannot publish to drivers or commuters.
+- **Output contract:** a single `Proposal` object (see `spec.md`).
 
-| ID | Constraint |
-|---|---|
-| C1 | Every telemetry record must carry a valid Ed25519 signature |
-| C2 | Records older than 60 seconds are discarded (replay protection) |
-| C3 | Device authentication by mTLS client certificate, one topic per device |
-| C4 | Agents may issue only the four approved commands |
-| C5 | Telemetry fields are treated as data and never parsed as instructions |
-| C6 | Audit log is append-only and readable by the regulator |
+### 2.3 Validator Agent
 
-### 3.4 Privacy constraints
+- **Job:** Check the proposal against safety, policy and security rules.
+  Approve, edit or veto. **Nothing reaches a driver without passing here.**
+- **Tools:** `policy.check()`, `audit.write()`, `veto()`
+- **Permission:** approve / veto, write to the immutable audit log.
+- **Hard rules it enforces:**
+  1. Hold duration ≤ 120 seconds.
+  2. No halt may be left unserved for more than 20 minutes.
+  3. Skip-stop is forbidden if a wheelchair or assistance request is registered.
+  4. No advisory to a driver whose duty hours are already exceeded.
+  5. Only the four commands in the approved set may be issued.
+  6. Fairness: holds must be distributed across operators, not loaded onto one.
 
-| ID | Constraint |
-|---|---|
-| P1 | Counts only — no faces, no CCTV, no fare-card identifiers |
-| P2 | Halt demand aggregated at halt level, never per person |
-| P3 | Location data retained for 7 days, then aggregated and purged |
-| P4 | Driver performance reported per depot, not per named individual |
+### 2.4 Action Agent
+
+- **Job:** Publish the approved advisory and record what happened.
+- **Tools:** `notify.driver()`, `notify.commuter()`, `dashboard.update()`,
+  `outcome.record()`
+- **Permission:** write to the notification bus only. No access to raw telemetry,
+  no access to policy configuration.
+
+### 2.5 Learning loop
+
+Every proposal — accepted, edited or vetoed — is scored 15 minutes later against
+the realised headway. The score set feeds the Planner's next-cycle priors. No
+model weights are changed automatically; retraining is a reviewed, offline step.
 
 ---
 
-## 4. Success metrics (pilot)
+## 3. The decision loop
 
-| Metric | Baseline | Target |
+```
+INPUTS ──► MONITOR ──► PLANNER ──► VALIDATOR ──► ACTION
+  ▲                                                 │
+  └──────────────── learn / re-observe ◄────────────┘
+```
+
+One full cycle runs every 30 seconds per corridor.
+
+---
+
+## 4. Approved command set
+
+The system may issue **only** these four actions. Anything else is rejected by the
+Validator by default.
+
+| Command | Meaning | Cap |
 |---|---|---|
-| Standard deviation of headway | measured week 1 | −30% |
-| Denial-of-boarding events per day | measured week 1 | −40% |
-| Advisory compliance rate | — | ≥ 60% by week 8 |
-| Validator veto rate | — | tracked, investigated if > 15% |
-| New vehicles required | — | 0 |
-| New per-bus hardware cost | — | Rs. 0 on day one |
+| `HOLD` | Wait at the current halt before departing | ≤ 120 s |
+| `SKIP_STOP` | Pass a halt with no waiting passengers | ≤ 2 consecutive halts |
+| `SHORT_TURN` | End the trip early and restart in the opposite direction | ≤ 1 per bus per shift |
+| `NOTIFY` | Push a corrected ETA or a crowding warning | unlimited |
 
 ---
+
+## 5. Non-negotiables
+
+1. **Advisory only.** No actuator, no vehicle control, ever.
+2. **Human override.** A depot controller can cancel any advisory and halt the OS
+   in one action. The stop rule is always available.
+3. **Least privilege.** Each agent holds the narrowest scope its job needs.
+4. **Full audit trail.** Every proposal, veto and action is logged with agent,
+   input snapshot, reason and timestamp.
+5. **Telemetry is data, never instruction.** No field from the stream is ever
+   interpreted as a command by any agent.
+
 
 ## 5. Out of scope
 
