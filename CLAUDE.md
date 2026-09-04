@@ -1,72 +1,176 @@
-# TransitPulse — Agentic AI Ecosystem for Predictive Bus Capacity & Dynamic Route Allocation
 
-**Track:** SDG 11 – Sustainable Cities & Communities
-**Team deliverable:** System scope + agent roles (GitHub repo root spec)
+# spec.md — Transit-pulse 
+
+Inputs, outputs and constraints for the RideFlow Agentic AI OS.
 
 ---
 
-## 1. One-Sentence Description
-TransitPulse is a multi-agent AI ecosystem that ingests real-time (simulated) bus telemetry to predict overcrowding and delays, and autonomously recommends verified, secure bus-reallocation actions before problems reach passengers.
+## 1. Inputs
 
-## 2. Exact Problem Statement
-Public bus fleets are dispatched on fixed timetables regardless of real demand. As a result, some buses run overcrowded on high-demand routes while others run nearly empty on low-demand routes at the same time. This causes long passenger wait times, unsafe crowding, wasted fuel/emissions from underused trips, and no mechanism to detect or correct the imbalance in real time.
+### 1.1 Live telemetry (simulated)
 
-## 3. Target Users
-| User | Need |
-| :--- | :--- |
-| **Passengers** | Reliable capacity, shorter waits, real-time alerts |
-| **Bus drivers** | Clear, validated instructions (no conflicting orders) |
-| **Transport operators / fleet managers** | Visibility + AI-assisted, explainable dispatch decisions |
-| **City traffic authorities** | Reduced congestion & emissions from smarter allocation |
+Published every 30 seconds per bus to the MQTT topic `rideflow/138/<device_id>`.
 
-## 4. Scope
-* **In scope:** One urban bus network (multiple routes, shared fleet pool), simulated IoT telemetry, agentic reasoning over that telemetry, and a security layer that protects the decisions the agents make.
-* **Out of scope:** Ticketing/payments, physical hardware procurement, city-wide traffic-signal control (traffic level is *consumed* as an input, not controlled).
+```json
+{
+  "device_id": "bus-138-07",
+  "operator": "private",
+  "route": "138",
+  "direction": "inbound",
+  "ts": "2026-08-01T10:15:30Z",
+  "lat": 6.8721,
+  "lon": 79.8886,
+  "speed_kmh": 18.4,
+  "next_halt": "nugegoda",
+  "occupancy": 47,
+  "capacity": 54,
+  "headway_s": 40,
+  "sig": "ed25519:9f2c8ab1..."
+}
+```
 
-## 5. System Actors
-* **Passengers** — generate implicit demand signals (boarding/alighting) and receive alerts.
-* **Buses** — carry sensors; execute dispatch/reallocation instructions.
-* **Bus drivers** — human-in-the-loop executors of agent recommendations.
-* **Transport operators** — approve high-impact actions; can override any agent.
-* **Traffic systems** — external data source (congestion level) consumed by the ecosystem.
-* **IoT devices/sensors** — GPS module, passenger-counting sensor, capacity/door sensor, telemetry transmitter (simulated).
-* **AI agents** — Monitor, Prediction, Planning, Efficiency, Arbiter, Security.
-* **Security systems** — device authentication, anomaly detection, audit logging.
+### 1.2 Halt telemetry (simulated)
 
-## 6. Agentic AI OS – Roles
+```json
+{
+  "device_id": "halt-nugegoda",
+  "ts": "2026-08-01T10:15:30Z",
+  "waiting_est": 22,
+  "last_departure_ts": "2026-08-01T10:07:10Z",
+  "assist_request": false,
+  "sig": "ed25519:41ba07d9..."
+}
+```
 
-### 6.1 Monitor Agent
-* **Input:** Live telemetry stream (JSON events, see `spec.md`).
-* **Processing:** Compares each reading against thresholds (capacity %, speed near-zero duration, GPS gaps); tags anomalies and "watch" states.
-* **Output:** Structured events — `normal`, `overcrowding_watch`, `delay_watch`, `data_anomaly`.
-* **Talks to:** Prediction Agent (forwards watch events), Security Agent (forwards `data_anomaly`).
+### 1.3 Static reference data
 
-### 6.2 Prediction Agent
-* **Input:** Telemetry history (sliding 30-minute window) + current watch event + static route baseline.
-* **Processing:** Short-horizon forecast: "will this route exceed 90% capacity or 15-minute delay in the next 10–30 minutes?" Computes a calibrated confidence score.
-* **Output:** `prediction_report` with `predicted_overcrowding_prob`, `predicted_delay_min`, `confidence_score` (0.0 to 1.0).
-* **Talks to:** Planning Agent (if confidence >= 0.70); logs otherwise.
+- Route 138 halt list with sequence, coordinates and expected run times.
+- Published timetable and planned headway per time band.
+- Fleet register: bus id, operator, capacity, depot.
+- Driver duty-hour records (aggregate, no personal identifiers).
 
-### 6.3 Planning Agent
-* **Input:** `prediction_report` + current fleet state (idle buses, buses on low-demand routes, driver duty limits).
-* **Processing:** Identifies possible remediations: dispatch idle relief bus, reallocate a bus from an under-utilized route, or issue passenger advisory.
-* **Output:** `proposed_action` with action type, source bus ID, target route ID, estimated relief impact.
-* **Talks to:** Efficiency Agent.
+### 1.4 Virtual sensor set
 
-### 6.4 Efficiency Agent
-* **Input:** `proposed_action` from Planning Agent.
-* **Processing:** Computes cost, fuel use, driver shift limits, and evaluates cross-route impact (does moving this bus cause a shortage on its current route?).
-* **Output:** `efficiency_assessment` (supports proposal or raises objection).
-* **Talks to:** Arbiter Agent.
+| Sensor | Metric | Frequency | Purpose |
+|---|---|---|---|
+| GPS tracker | `lat`, `lon`, `speed_kmh` | 30 s | position and headway |
+| Passenger counter | `occupancy` | on door close | load and crowding |
+| Halt crowd sensor | `waiting_est` | 30 s | demand ahead of the bus |
+| Fuel / emission meter | `fuel_lph` | 60 s | SDG 13 reporting only |
 
-### 6.5 Arbiter Agent
-* **Input:** Proposals from Planning Agent + Objections from Efficiency Agent.
-* **Processing:** Applies strict 6-rule priority table (safety/security first, capacity >85% favors passengers, human override for cross-route harm).
-* **Output:** `final_decision` (`approve`, `modify`, `reject`, or `escalate_to_human`).
-* **Talks to:** Security Agent for final command validation.
+---
 
-### 6.6 Security Agent
-* **Input:** Raw telemetry packets, system command queue.
-* **Processing:** Validates device signatures, verifies physical telemetry bounds (speed, odometer vs GPS), checks command whitelists.
-* **Output:** Device trust score (0.0–1.0) and command clearance/veto.
-* **Talks to:** Monitor Agent, Arbiter Agent, and System Dispatcher.
+## 2. Outputs
+
+### 2.1 Proposal (Planner → Validator)
+
+```json
+{
+  "proposal_id": "p-20260801-1015-0042",
+  "agent": "planner",
+  "target": "bus-138-07",
+  "command": "HOLD",
+  "value_s": 75,
+  "at_halt": "nugegoda",
+  "reason": "headway 40 s against a 300 s target; bus-138-09 is 40 s behind",
+  "expected_effect": "headway restored to ~210 s within 2 halts",
+  "confidence": 0.78
+}
+```
+
+### 2.2 Advisory (Action → driver / commuter / dashboard)
+
+```json
+{
+  "advisory_id": "a-20260801-1015-0042",
+  "proposal_id": "p-20260801-1015-0042",
+  "target": "bus-138-07",
+  "display": "HOLD 75s",
+  "expires_ts": "2026-08-01T10:17:00Z",
+  "approved_by": "validator",
+  "override_url": "depot://cancel/a-20260801-1015-0042"
+}
+```
+
+### 2.3 Audit record (every cycle, append-only)
+
+```json
+{
+  "ts": "2026-08-01T10:15:32Z",
+  "proposal_id": "p-20260801-1015-0042",
+  "verdict": "approved",
+  "rules_checked": ["hold_cap", "halt_starvation", "assist_flag", "duty_hours", "fairness"],
+  "validator_note": "within all limits",
+  "outcome_score": null
+}
+```
+
+### 2.4 Commuter output
+
+A corrected ETA per halt, plus a crowding indicator (`green` / `amber` / `red`).
+No bus identifier, no driver identifier, no passenger data.
+
+---
+
+## 3. Constraints
+
+### 3.1 Safety constraints
+
+| ID | Constraint |
+|---|---|
+| S1 | Maximum hold duration: 120 seconds |
+| S2 | No halt unserved for more than 20 minutes |
+| S3 | Skip-stop forbidden when an assistance request is registered |
+| S4 | No advisory to a driver over duty hours |
+| S5 | No advisory that would require exceeding the speed limit |
+
+### 3.2 Operational constraints
+
+| ID | Constraint |
+|---|---|
+| O1 | Holds distributed fairly across operators over a rolling 60 minutes |
+| O2 | Maximum 1 short-turn per bus per shift |
+| O3 | Advisories expire after 120 seconds if not acknowledged |
+| O4 | On sensor loss, the OS degrades to schedule-only mode and issues no holds |
+
+### 3.3 Security constraints
+
+| ID | Constraint |
+|---|---|
+| C1 | Every telemetry record must carry a valid Ed25519 signature |
+| C2 | Records older than 60 seconds are discarded (replay protection) |
+| C3 | Device authentication by mTLS client certificate, one topic per device |
+| C4 | Agents may issue only the four approved commands |
+| C5 | Telemetry fields are treated as data and never parsed as instructions |
+| C6 | Audit log is append-only and readable by the regulator |
+
+### 3.4 Privacy constraints
+
+| ID | Constraint |
+|---|---|
+| P1 | Counts only — no faces, no CCTV, no fare-card identifiers |
+| P2 | Halt demand aggregated at halt level, never per person |
+| P3 | Location data retained for 7 days, then aggregated and purged |
+| P4 | Driver performance reported per depot, not per named individual |
+
+---
+
+## 4. Success metrics (pilot)
+
+| Metric | Baseline | Target |
+|---|---|---|
+| Standard deviation of headway | measured week 1 | −30% |
+| Denial-of-boarding events per day | measured week 1 | −40% |
+| Advisory compliance rate | — | ≥ 60% by week 8 |
+| Validator veto rate | — | tracked, investigated if > 15% |
+| New vehicles required | — | 0 |
+| New per-bus hardware cost | — | Rs. 0 on day one |
+
+---
+
+## 5. Out of scope
+
+- Fare collection and ticketing.
+- Route planning or timetable redesign.
+- Any direct control of a vehicle.
+- Inter-provincial long-distance services.
